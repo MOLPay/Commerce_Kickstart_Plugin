@@ -1,0 +1,360 @@
+<?php
+
+/**
+ * @file
+ * Implements MOLPay for use with Drupal Commerce.
+ */
+
+function commerce_molpay_commerce_payment_method_info() {
+  $payment_methods = array();
+
+  $icons = commerce_molpay_icons();
+  $display_title = t('MOLPay Payment Gateway');
+  $display_title .= '<div class="commerce-molpay-icons">'. implode(' ', $icons) . '</div>';
+
+
+  unset ($icons['molpay']);
+
+  $payment_methods['molpay'] = array(
+    'base' => 'commerce_molpay',
+    'title' => t('molpay'),
+    'short_title' => t('molpay'),
+    'display_title' => $display_title,
+    'description' => t('molpay'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  );
+
+  return $payment_methods;
+}
+
+
+/**
+ *    Payment method callback: settings form.
+ */
+function commerce_molpay_settings_form($settings = NULL) {
+  $form = array();
+
+  $settings = (array) $settings + array(
+    'business' => '',
+    'secret_word' => '',
+    'fixed' => true,
+    'language' => 'en',
+    'logging' => 'full',
+  );
+
+  //    merchant ID
+  $form['business'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Merchant ID'),
+    '#description' => t('Your MOLPay Merchant ID.'),
+    '#default_value' => $settings['business'],
+    '#maxlength' => 34,
+    '#required' => TRUE,
+  );
+  //    verify key
+  $form['secret_word'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Verify Key'),
+    '#description' => t('Your MOLPay Verify Key<br/>Must be the same value in your Merchant Profile Page.'),
+    '#default_value' => $settings['secret_word'],
+    '#maxlength' => 34,
+    '#required' => TRUE,
+  );
+  $form['language'] = array(
+    '#type' => 'select',
+    '#title' => t('Checkout page language.'),
+    '#options' => commerce_molpay_languages(),
+    '#default_value' => $settings['language'],
+  );
+  /*
+  $form['logging'] = array(
+    '#type' => 'radios',
+    '#title' => t('Logging'),
+    '#options' => array(
+      'notification' => t('Log notifications during processing.'),
+      'full' => t('Log notifications with all data during validation and processing (used for debugging).'),
+    ),
+    '#default_value' => $settings['logging'],
+  );
+  */
+  return $form;
+}
+
+
+/**
+ *    Payment method callback: adds a message and CSS to the submission form.
+ */
+function commerce_molpay_submit_form($payment_method, $pane_values, $checkout_pane, $order) {
+  $form['molpay_information'] = array(
+    '#markup' => '<span class="commerce-molpay-info">' . t('(Continue with checkout to complete payment via MOLPay.)') . '</span>',
+  );
+
+  return $form;
+}
+
+
+/**
+ *   Payment method callback: redirect form, a wrapper around the module's general
+ *   use function for building a MOLPay form.
+ */
+function commerce_molpay_redirect_form($form, &$form_state, $order, $payment_method) {
+  // Return an error if the enabling action's settings haven't been configured.
+  if (empty($payment_method['settings']['business'])) {
+    drupal_set_message(t('MOLPay is not configured for use. No MOLPay account has been specified.'), 'error');
+    return array();
+  }
+
+  return commerce_molpay_order_form($form, $form_state, $order, $payment_method['settings']);
+}
+
+
+/**
+ *  Payment method callback: all returns from MOLPay are returned here.
+ */
+function commerce_molpay_redirect_form_validate($order, $payment_method) {
+
+  if (!empty($payment_method['settings']['logging']) &&
+    $payment_method['settings']['logging'] == 'full') {
+    watchdog('commerce_molpay', 'Customer returned from MOLPay with the following POST data:<pre>' . check_plain(print_r($_POST, TRUE)) . '</pre>', array(), WATCHDOG_NOTICE);
+  }
+  
+  global $user;
+  commerce_checkout_complete($order);
+  //$status_message = commerce_order_commerce_order_state_info();
+
+  //    merchant information
+  $domain = $payment_method['settings']['business'];
+  $vkey   = $payment_method['settings']['secret_word'];
+
+  //    retrieve POST from MOLPay
+  $tranID   = $_POST['tranID'];
+  $orderid  = $_POST['orderid'];
+  $status   = $_POST['status'];
+  $domain   = $_POST['domain'];
+  $amount   = $_POST['amount'];
+  $currency = $_POST['currency'];
+  $appcode  = $_POST['appcode'];
+  $paydate  = $_POST['paydate'];
+  $skey     = $_POST['skey'];
+
+  //    retrieve transaction
+  $transaction = commerce_payment_transaction_new('molpay', $orderid);
+  $transaction->instance_id   = $payment_method['instance_id']; //payment method
+  //$transaction->amount        = $amount;
+  //$transaction->amount        = commerce_currency_format($amount, $currency, NULL,TRUE);
+  $transaction->amount        = str_replace('.', '', str_replace(',', '', $amount));
+  $transaction->currency_code = $currency;
+  $transaction->skey          = $skey;
+  $transaction->paydate       = $paydate;
+  $transaction->appcode       = $appcode;
+  $transaction->tranID        = $tranID;
+  $settings                   = $payment_method['settings'];
+
+  $key0 = md5( $tranID.$orderid.$status.$domain.$amount.$currency );
+  $key1 = md5( $paydate.$domain.$key0.$appcode.$vkey );
+
+  if( $skey != $key1 ) $status= -1; // Invalid transaction
+  
+  if ( $status == "00" ) {
+    //  Success payment 
+    $transaction->status        = COMMERCE_PAYMENT_STATUS_SUCCESS;
+    $transaction->status_code   = $status;
+    $transaction->message       = t('The payment has completed.');
+    commerce_order_status_update($order, 'completed');
+    $message = t('The payment has completed.');
+    $status = t('status');
+    $transaction->remote_status = 'Paid';
+  } 
+  elseif( $status == "22" ) {
+    //  cash payment
+    $transaction->status        = COMMERCE_PAYMENT_STATUS_PENDING;
+    $transaction->status_code   = $status;
+    $transaction->message       = t('Awaiting Payment from Buyer to make physical payment');
+    commerce_order_status_update($order, 'processing');
+    $message = t('Awaiting Payment from Buyer to make physical payment');
+    $status = t('status');
+    $transaction->remote_status = 'Awaiting Payment';
+    
+  }
+  else {
+    //  failure action
+    $transaction->status        = COMMERCE_PAYMENT_STATUS_FAILURE;
+    $transaction->status_code   = $status;
+    $transaction->message       = t('Payment status failed');
+    commerce_order_status_update($order, 'pending');
+    //$order->status = 'canceled';
+    $transaction->remote_status = 'failed';
+    $message = t('Payment status failed');
+    $status = t('error');
+    
+  }
+
+    //  Display message
+    drupal_set_message($message, $status);
+  
+    //  Save the transaction information.
+    commerce_order_save ($order);
+    commerce_payment_transaction_save($transaction);
+
+
+}
+
+
+/**
+ * Helper function to get some country code; requires Apache's mod_geoip to
+ * be loaded and enabled.
+ */
+function commerce_molpay_guess_country_code () {
+  $country_code = isset ($_REQUEST['country_code']) ? $_REQUEST['country_code'] : apache_note('GEOIP_COUNTRY_CODE');
+  return $country_code;
+}
+
+
+/**
+ * Keyed array of MOLPay parameters
+ */
+function commerce_molpay_purchase_parameters ($order, $settings) {
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+  $currency_code = $wrapper->commerce_order_total->currency_code->value();
+  $amount = number_format(commerce_currency_amount_to_decimal($order->commerce_order_total['und'][0]['amount'], $order->commerce_order_total['und'][0]['currency_code']), 2);
+
+  $merchantID = $settings['business'];
+  $verifykey = $settings['secret_word'];
+  $orderid = $order->order_id;
+
+  if (isset ($order->commerce_customer_billing[LANGUAGE_NONE][0])) {
+    $billing_address = $wrapper->commerce_customer_billing->commerce_customer_address->value();
+    $profile_id = $order->commerce_customer_billing[LANGUAGE_NONE][0]['profile_id'];
+    $profile = commerce_customer_profile_load ($profile_id);
+  }
+  
+  if (isset ($order->commerce_customer_shipping[LANGUAGE_NONE][0]))
+    $shipping_address = $wrapper->commerce_customer_shipping->commerce_customer_address->value();
+
+  //  Generate Vcode
+    $vcode    = md5( $amount.$merchantID.$orderid.$verifykey );
+  //  Build the data array that will be translated into hidden form values.
+    
+  $data = array (
+
+    //   amount
+    'amount' => $amount,
+
+    //   vcode
+    'vcode' =>  $vcode,
+
+    //  Set language code
+    'langcode' => $settings['language'],
+
+    'orderid' => $order->order_id,
+
+    //  return url
+    'returnurl' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], array('absolute' => TRUE)),
+
+    // Populate customer information
+    'bill_name' => isset ($billing_address) ? $billing_address['name_line']: '',
+
+    //  country
+    'country' => $billing_address['country'] ,
+
+    //  email
+    'bill_email' => $order->mail,
+
+    // Order description
+    'bill_desc' => "Commerce Kickstart - Order no ".$order->order_id,
+  );
+  
+  $data['currency'] = $currency_code;
+
+  return $data;
+}
+
+
+/**
+ * Builds a MOLPay form from an order object.
+ *
+ * @param $order
+ *   The fully loaded order being paid for.
+ * @param $settings
+ *   An array of settings used to build out the form, including:
+ *   - account: the MOLPay account the payment submits to
+ *   - return_url: the URL MOLPay should send the user to on successful payment
+ *   - language: the language code to use on the payment form
+ *
+ * @return
+ *   A renderable form array.
+ */
+function commerce_molpay_order_form($form, &$form_state, $order, $settings) {
+  $data = commerce_molpay_purchase_parameters ($order, $settings);
+
+  $form['#action'] = commerce_molpay_server_url($settings);
+
+  $form['redirect'] = array(
+            '#markup' => '<br />' . t('<p>You are being redirected to MOLPay payment page. If not, click on the button below.</p>'),
+  );
+
+  foreach ($data as $name => $value) {
+    if (!empty($value)) {
+      $form[$name] = array('#type' => 'hidden', '#value' => $value);
+    }
+  }
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to MOLPay'),
+  );
+
+  return $form;
+}
+
+
+/**
+ * Returns MOLPay payment method icon img elements.
+ *
+ * @return
+ *   
+ *   
+ */
+function commerce_molpay_icons() {
+  $icons = array();
+
+  $payment_methods = array(
+    'molpay' => t('Molpay'),
+  );
+
+  foreach ($payment_methods as $name => $title) {
+    $path = url(drupal_get_path('module', 'commerce_molpay') . '/images/' . $name . '.gif', array('absolute' => TRUE));
+    $icons[$name] = '<img src="' . $path . '" alt="' . $title . '" title="' . $title . '" class="commerce-molpay-icon" />';
+  }
+
+  return $icons;
+}
+
+
+/**
+ * @return
+ *   The URL to use to submit requests to MOLPay
+ */
+function commerce_molpay_server_url ($settings) {
+  //molpay address
+  return "https://www.onlinepayment.com.my/MOLPay/pay/".$settings['business']."/";
+}
+
+
+/**
+ * Returns an array of all possible language codes.
+ */
+function commerce_molpay_languages() {
+  return array('en' => 'English', 'zh' => 'Chinese', 'da' => 'Danish', 'nl' => 'Dujtch', 'fr' => 'French', 'gr' => 'German', 'el' => 'Greek', 'it' => 'Italian', 'jp' => 'Japanese', 'no' => 'Norwegian', 'pt' => 'Portugese', 'sl' => 'Slovenian', 'es_ib' => 'Spanish (es_ib)', 'es_la' => 'Spanish (es_la)', 'sv' => 'Swedish');
+}
+
+
+/**
+ * Returns an array of all possible currency codes.
+ */
+function commerce_molpay_currencies() {
+  return drupal_map_assoc(array('AUD', 'BRL', 'CAD', 'CHF', 'CZK', 'DKK', 'EUR', 'GBP', 'HKD', 'HUF', 'ILS', 'JPY', 'MXN', 'MYR', 'NOK', 'NZD', 'PHP', 'PLN', 'SEK', 'SGD', 'THB', 'TWD', 'USD'));
+}
