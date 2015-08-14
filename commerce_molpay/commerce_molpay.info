@@ -1,6 +1,6 @@
 name = Commerce molpay
 description = Payment using molpay
-package = Commerce (contrib)
+package = Commerce MOLPay
 
 dependencies[] = commerce
 dependencies[] = commerce_ui
